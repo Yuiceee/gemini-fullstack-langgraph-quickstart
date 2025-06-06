@@ -241,6 +241,17 @@ export function ChatMessagesView({
 }: ChatMessagesViewProps) {
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
 
+  // 调试AI消息
+  messages.forEach((msg, index) => {
+    if (msg.type === "ai") {
+      console.log(`AI Message ${index}:`, {
+        id: msg.id,
+        content: msg.content,
+        hasHistory: !!historicalActivities[msg.id!]
+      });
+    }
+  });
+
   const handleCopy = async (text: string, messageId: string) => {
     try {
       await navigator.clipboard.writeText(text);
@@ -260,9 +271,8 @@ export function ChatMessagesView({
             return (
               <div key={message.id || `msg-${index}`} className="space-y-3">
                 <div
-                  className={`flex items-start gap-3 ${
-                    message.type === "human" ? "justify-end" : ""
-                  }`}
+                  className={`flex items-start gap-3 ${message.type === "human" ? "justify-end" : ""
+                    }`}
                 >
                   {message.type === "human" ? (
                     <HumanMessageBubble

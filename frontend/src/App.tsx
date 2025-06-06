@@ -13,7 +13,11 @@ export default function App() {
     Record<string, ProcessedEvent[]>
   >({});
   const scrollAreaRef = useRef<HTMLDivElement>(null);
-  const hasFinalizeEventOccurredRef = useRef(false);
+  const processedEventsRef = useRef<ProcessedEvent[]>([]);
+
+  useEffect(() => {
+    processedEventsRef.current = processedEventsTimeline;
+  }, [processedEventsTimeline]);
 
   const thread = useStream<{
     messages: Message[];
@@ -27,14 +31,30 @@ export default function App() {
     assistantId: "agent",
     messagesKey: "messages",
     onFinish: (event: any) => {
-      console.log(event);
+      console.log("onFinish event:", event);
+      setTimeout(() => {
+        if (thread.messages.length > 0) {
+          const lastMessage = thread.messages[thread.messages.length - 1];
+          console.log("onFinish - Latest message:", lastMessage);
+          if (lastMessage && lastMessage.type === "ai" && lastMessage.id) {
+            const currentEvents = processedEventsRef.current;
+            console.log("onFinish - Current events:", currentEvents);
+            if (currentEvents.length > 0) {
+              setHistoricalActivities((prev) => ({
+                ...prev,
+                [lastMessage.id!]: [...currentEvents],
+              }));
+            }
+          }
+        }
+      }, 0);
     },
     onUpdateEvent: (event: any) => {
       let processedEvent: ProcessedEvent | null = null;
       if (event.generate_query) {
         processedEvent = {
           title: "Generating Search Queries",
-          data: event.generate_query.query_list.join(", "),
+          data: (event.generate_query.query_list || []).join(", "),
         };
       } else if (event.web_research) {
         const sources = event.web_research.sources_gathered || [];
@@ -45,25 +65,23 @@ export default function App() {
         const exampleLabels = uniqueLabels.slice(0, 3).join(", ");
         processedEvent = {
           title: "Web Research",
-          data: `Gathered ${numSources} sources. Related to: ${
-            exampleLabels || "N/A"
-          }.`,
+          data: `Gathered ${numSources} sources. Related to: ${exampleLabels || "N/A"
+            }.`,
         };
       } else if (event.reflection) {
         processedEvent = {
           title: "Reflection",
           data: event.reflection.is_sufficient
             ? "Search successful, generating final answer."
-            : `Need more information, searching for ${event.reflection.follow_up_queries.join(
-                ", "
-              )}`,
+            : `Need more information, searching for ${(event.reflection.follow_up_queries || []).join(
+              ", "
+            )}`,
         };
       } else if (event.finalize_answer) {
         processedEvent = {
           title: "Finalizing Answer",
           data: "Composing and presenting the final answer.",
         };
-        hasFinalizeEventOccurredRef.current = true;
       }
       if (processedEvent) {
         setProcessedEventsTimeline((prevEvents) => [
@@ -86,27 +104,19 @@ export default function App() {
   }, [thread.messages]);
 
   useEffect(() => {
-    if (
-      hasFinalizeEventOccurredRef.current &&
-      !thread.isLoading &&
-      thread.messages.length > 0
-    ) {
+    if (thread.messages.length > 0) {
       const lastMessage = thread.messages[thread.messages.length - 1];
+      console.log("Latest message:", lastMessage);
       if (lastMessage && lastMessage.type === "ai" && lastMessage.id) {
-        setHistoricalActivities((prev) => ({
-          ...prev,
-          [lastMessage.id!]: [...processedEventsTimeline],
-        }));
+        console.log("AI message content:", lastMessage.content);
       }
-      hasFinalizeEventOccurredRef.current = false;
     }
-  }, [thread.messages, thread.isLoading, processedEventsTimeline]);
+  }, [thread.messages]);
 
   const handleSubmit = useCallback(
     (submittedInputValue: string, effort: string, model: string) => {
       if (!submittedInputValue.trim()) return;
       setProcessedEventsTimeline([]);
-      hasFinalizeEventOccurredRef.current = false;
 
       // convert effort to, initial_search_query_count and max_research_loops
       // low means max 1 loop and 1 query
@@ -156,9 +166,8 @@ export default function App() {
     <div className="flex h-screen bg-neutral-800 text-neutral-100 font-sans antialiased">
       <main className="flex-1 flex flex-col overflow-hidden max-w-4xl mx-auto w-full">
         <div
-          className={`flex-1 overflow-y-auto ${
-            thread.messages.length === 0 ? "flex" : ""
-          }`}
+          className={`flex-1 overflow-y-auto ${thread.messages.length === 0 ? "flex" : ""
+            }`}
         >
           {thread.messages.length === 0 ? (
             <WelcomeScreen
