@@ -118,3 +118,26 @@ Open your browser and navigate to `http://localhost:8123/app/` to see the applic
 ## License
 
 This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details. 
+
+
+
+
+
+# backend cli  example 使用
+
+ 使用起来很简单：
+  python examples/cli_research.py "研究问题"                    # 默认deepseek + web搜索
+  python examples/cli_research.py "研究问题" --model-provider gemini  # 使用gemini
+  python examples/cli_research.py "研究问题" --no-web-search         # 直接回答模式
+
+
+# 0625 更新：
+已完成：
+增加支持火山引擎deepseek ，增加可选择是否进行web search。
+问题：
+1. Gemini api卡全局代理，限制严格
+2. 火山引擎中Deepseek r1支持结构化输出、但深度思考无法关闭、推理时间较长
+  1. 进行web search：initial_search_query_count =3，max_research_loops=2 ，推理时间4-5min （但网页端一直有输出还是可以接受的）
+  2. 不进行web search：推理时间1min
+todo：
+1. 增加mcp 调用
