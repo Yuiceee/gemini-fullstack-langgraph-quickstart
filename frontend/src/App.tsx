@@ -16,12 +16,19 @@ export default function App() {
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const hasFinalizeEventOccurredRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
-  const thread = useStream<{
+  interface OverallState extends Record<string, unknown> {
     messages: Message[];
     initial_search_query_count: number;
     max_research_loops: number;
     reasoning_model: string;
-  }>({
+    enable_web_search: boolean;
+    search_query?: any[];
+    web_research_result?: any[];
+    sources_gathered?: any[];
+    research_loop_count?: number;
+  }
+
+  const thread = useStream<OverallState>({
     apiUrl: import.meta.env.DEV
       ? "http://localhost:2024"
       : "http://localhost:8123",
@@ -100,7 +107,7 @@ export default function App() {
   }, [thread.messages, thread.isLoading, processedEventsTimeline]);
 
   const handleSubmit = useCallback(
-    (submittedInputValue: string, effort: string, model: string) => {
+    (submittedInputValue: string, effort: string, model: string, enableWebSearch: boolean, modelProvider: string) => {
       if (!submittedInputValue.trim()) return;
       setProcessedEventsTimeline([]);
       hasFinalizeEventOccurredRef.current = false;
@@ -134,12 +141,32 @@ export default function App() {
           id: Date.now().toString(),
         },
       ];
+
+      // Prepare configuration based on model provider
+      const configurable: any = {
+        model_provider: modelProvider,
+        initial_search_query_count: initial_search_query_count,
+        max_research_loops: max_research_loops,
+      };
+
+      // Set the appropriate model based on provider
+      if (modelProvider === "gemini") {
+        configurable.gemini_query_model = model;
+        configurable.gemini_reflection_model = model;
+        configurable.gemini_answer_model = model;
+      } else if (modelProvider === "deepseek") {
+        configurable.deepseek_query_model = model;
+        configurable.deepseek_reflection_model = model;
+        configurable.deepseek_answer_model = model;
+      }
+
       thread.submit({
         messages: newMessages,
+        enable_web_search: enableWebSearch,
         initial_search_query_count: initial_search_query_count,
         max_research_loops: max_research_loops,
         reasoning_model: model,
-      });
+      } as any, configurable);
     },
     [thread]
   );

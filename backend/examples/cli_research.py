@@ -20,20 +20,34 @@ def main() -> None:
         help="Maximum number of research loops",
     )
     parser.add_argument(
-        "--reasoning-model",
-        default="gemini-2.5-pro-preview-05-06",
-        help="Model for the final answer",
+        "--model-provider",
+        choices=["gemini", "deepseek"],
+        default="deepseek",
+        help="Model provider to use (gemini or deepseek)",
+    )
+    parser.add_argument(
+        "--no-web-search",
+        action="store_true",
+        help="Disable web search and use direct answer mode",
     )
     args = parser.parse_args()
+
+    config = {
+        "configurable": {
+            "model_provider": args.model_provider,
+        }
+    }
 
     state = {
         "messages": [HumanMessage(content=args.question)],
         "initial_search_query_count": args.initial_queries,
         "max_research_loops": args.max_loops,
-        "reasoning_model": args.reasoning_model,
+        "enable_web_search": not args.no_web_search,
     }
 
-    result = graph.invoke(state)
+    print(f"Using {args.model_provider} provider with {'web search' if not args.no_web_search else 'direct answer'} mode")
+    
+    result = graph.invoke(state, config=config)
     messages = result.get("messages", [])
     if messages:
         print(messages[-1].content)

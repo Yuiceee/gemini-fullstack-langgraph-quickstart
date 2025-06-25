@@ -7,7 +7,9 @@ from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
+from openai import OpenAI
 from google.genai import Client
+from tavily import TavilyClient
 
 from agent.state import (
     OverallState,
@@ -23,6 +25,7 @@ from agent.prompts import (
     reflection_instructions,
     answer_instructions,
 )
+from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from agent.utils import (
     get_citations,
@@ -33,19 +36,37 @@ from agent.utils import (
 
 load_dotenv()
 
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
+# Check API keys - at least one must be available
+gemini_available = os.getenv("GEMINI_API_KEY") is not None
+deepseek_available = os.getenv("ARK_API_KEY") is not None
+tavily_available = os.getenv("TAVILY_API_KEY") is not None
 
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+if not gemini_available and not deepseek_available:
+    raise ValueError("Either GEMINI_API_KEY or ARK_API_KEY must be set")
+
+# Initialize clients if available
+genai_client = None
+openai_client = None
+tavily_client = None
+
+if gemini_available:
+    genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+if deepseek_available:
+    openai_client = OpenAI(
+        base_url="https://ark.cn-beijing.volces.com/api/v3",
+        api_key=os.getenv("ARK_API_KEY")
+    )
+
+if tavily_available:
+    tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 
 # Nodes
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
     """LangGraph node that generates search queries based on the User's question.
 
-    Uses Gemini 2.0 Flash to create an optimized search queries for web research based on
-    the User's question.
+    Uses either Gemini or DeepSeek to create optimized search queries for web research.
 
     Args:
         state: Current graph state containing the User's question
@@ -60,14 +81,51 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    structured_llm = llm.with_structured_output(SearchQueryList)
+    # Choose model based on provider
+    provider = configurable.model_provider
+    
+    if provider == "deepseek" and deepseek_available:
+        # Use DeepSeek
+        llm = ChatOpenAI(
+            model=configurable.deepseek_query_model,
+            temperature=1.0,
+            max_retries=2,
+            api_key=os.getenv("ARK_API_KEY"),
+            base_url=configurable.deepseek_api_base_url,
+        )
+    elif provider == "gemini" and gemini_available:
+        # Use Gemini
+        llm = ChatGoogleGenerativeAI(
+            model=configurable.gemini_query_model,
+            temperature=1.0,
+            max_retries=2,
+            api_key=os.getenv("GEMINI_API_KEY"),
+        )
+    else:
+        # Fallback to available provider
+        if gemini_available:
+            llm = ChatGoogleGenerativeAI(
+                model=configurable.gemini_query_model,
+                temperature=1.0,
+                max_retries=2,
+                api_key=os.getenv("GEMINI_API_KEY"),
+            )
+        elif deepseek_available:
+            llm = ChatOpenAI(
+                model=configurable.deepseek_query_model,
+                temperature=1.0,
+                max_retries=2,
+                api_key=os.getenv("ARK_API_KEY"),
+                base_url=configurable.deepseek_api_base_url,
+            )
+        else:
+            raise ValueError("No valid model provider available")
+
+    if provider == "deepseek" and deepseek_available:
+        # Use direct structured output for DeepSeek
+        structured_llm = llm.with_structured_output(SearchQueryList, method="json_mode")
+    else:
+        structured_llm = llm.with_structured_output(SearchQueryList)
 
     # Format the prompt
     current_date = get_current_date()
@@ -79,6 +137,23 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     # Generate the search queries
     result = structured_llm.invoke(formatted_prompt)
     return {"search_query": result.query}
+
+
+def decide_search_mode(state: OverallState):
+    """LangGraph routing function that decides whether to use web search or direct answer.
+    
+    Routes to either web research or direct answer based on the enable_web_search flag.
+    
+    Args:
+        state: Current graph state containing the enable_web_search flag
+        
+    Returns:
+        String indicating the next node ("generate_query" for web search, "direct_answer" for direct)
+    """
+    if state.get("enable_web_search", True):  # Default to True for backward compatibility
+        return "generate_query"
+    else:
+        return "direct_answer"
 
 
 def continue_to_web_research(state: QueryGenerationState):
@@ -93,9 +168,9 @@ def continue_to_web_research(state: QueryGenerationState):
 
 
 def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """LangGraph node that performs web research using the native Google Search API tool.
+    """LangGraph node that performs web research.
 
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
+    Uses either Google Search (Gemini) or Tavily (DeepSeek) based on the configured provider.
 
     Args:
         state: Current graph state containing the search query and research loop count
@@ -104,8 +179,27 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     Returns:
         Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
     """
-    # Configure
     configurable = Configuration.from_runnable_config(config)
+    provider = configurable.model_provider
+    
+    if provider == "deepseek" and deepseek_available and tavily_available:
+        # Use DeepSeek + Tavily
+        return _web_research_deepseek_tavily(state, configurable)
+    elif provider == "gemini" and gemini_available:
+        # Use Gemini + Google Search
+        return _web_research_gemini(state, configurable)
+    else:
+        # Fallback to available provider
+        if gemini_available:
+            return _web_research_gemini(state, configurable)
+        elif deepseek_available and tavily_available:
+            return _web_research_deepseek_tavily(state, configurable)
+        else:
+            raise ValueError("No valid web search provider available")
+
+
+def _web_research_gemini(state: WebSearchState, configurable: Configuration) -> OverallState:
+    """Web research using Gemini + Google Search."""
     formatted_prompt = web_searcher_instructions.format(
         current_date=get_current_date(),
         research_topic=state["search_query"],
@@ -113,7 +207,7 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
 
     # Uses the google genai client as the langchain client doesn't return grounding metadata
     response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
+        model=configurable.gemini_query_model,
         contents=formatted_prompt,
         config={
             "tools": [{"google_search": {}}],
@@ -128,6 +222,71 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     citations = get_citations(response, resolved_urls)
     modified_text = insert_citation_markers(response.text, citations)
     sources_gathered = [item for citation in citations for item in citation["segments"]]
+
+    return {
+        "sources_gathered": sources_gathered,
+        "search_query": [state["search_query"]],
+        "web_research_result": [modified_text],
+    }
+
+
+def _web_research_deepseek_tavily(state: WebSearchState, configurable: Configuration) -> OverallState:
+    """Web research using DeepSeek + Tavily."""
+    # First, perform Tavily search
+    search_results = tavily_client.search(
+        query=state["search_query"],
+        search_depth="advanced",
+        max_results=5
+    )
+    
+    # Extract search context
+    search_context = ""
+    sources_gathered = []
+    
+    for i, result in enumerate(search_results.get("results", [])):
+        search_context += f"Source {i+1}: {result.get('title', '')}\n"
+        search_context += f"URL: {result.get('url', '')}\n"
+        search_context += f"Content: {result.get('content', '')}\n\n"
+        
+        # Create source entry
+        short_url = f"[{state['id']}-{i+1}]"
+        sources_gathered.append({
+            "title": result.get('title', 'Unknown'),
+            "url": result.get('url', ''),
+            "snippet": result.get('content', '')[:200] + "...",
+            "short_url": short_url,
+            "value": result.get('url', ''),
+            "label": result.get('title', 'Web Source')
+        })
+    
+    # Now use DeepSeek to analyze and synthesize the search results
+    analysis_prompt = f"""Based on the following search results about "{state["search_query"]}", provide a comprehensive analysis and summary:
+
+Search Results:
+{search_context}
+
+Please provide:
+1. A detailed summary of the key findings
+2. Important facts and insights
+3. Any relevant context or background information
+
+Format your response clearly and cite the sources using [1], [2], etc. markers."""
+
+    # Use DeepSeek to analyze
+    llm = ChatOpenAI(
+        model=configurable.deepseek_query_model,
+        temperature=0.3,
+        max_retries=2,
+        api_key=os.getenv("ARK_API_KEY"),
+        base_url=configurable.deepseek_api_base_url,
+    )
+    
+    response = llm.invoke(analysis_prompt)
+    
+    # Replace source markers with short URLs
+    modified_text = response.content
+    for i, source in enumerate(sources_gathered):
+        modified_text = modified_text.replace(f"[{i+1}]", source["short_url"])
 
     return {
         "sources_gathered": sources_gathered,
@@ -151,9 +310,9 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         Dictionary with state update, including search_query key containing the generated follow-up query
     """
     configurable = Configuration.from_runnable_config(config)
-    # Increment the research loop count and get the reasoning model
+    # Increment the research loop count
     state["research_loop_count"] = state.get("research_loop_count", 0) + 1
-    reasoning_model = state.get("reasoning_model", configurable.reflection_model)
+    provider = configurable.model_provider
 
     # Format the prompt
     current_date = get_current_date()
@@ -162,14 +321,52 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         research_topic=get_research_topic(state["messages"]),
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
-    # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
+    
+    # Choose model based on provider
+    if provider == "deepseek" and deepseek_available:
+        # Use DeepSeek
+        llm = ChatOpenAI(
+            model=configurable.deepseek_reflection_model,
+            temperature=1.0,
+            max_retries=2,
+            api_key=os.getenv("ARK_API_KEY"),
+            base_url=configurable.deepseek_api_base_url,
+        )
+    elif provider == "gemini" and gemini_available:
+        # Use Gemini
+        llm = ChatGoogleGenerativeAI(
+            model=configurable.gemini_reflection_model,
+            temperature=1.0,
+            max_retries=2,
+            api_key=os.getenv("GEMINI_API_KEY"),
+        )
+    else:
+        # Fallback
+        if gemini_available:
+            llm = ChatGoogleGenerativeAI(
+                model=configurable.gemini_reflection_model,
+                temperature=1.0,
+                max_retries=2,
+                api_key=os.getenv("GEMINI_API_KEY"),
+            )
+        elif deepseek_available:
+            llm = ChatOpenAI(
+                model=configurable.deepseek_reflection_model,
+                temperature=1.0,
+                max_retries=2,
+                api_key=os.getenv("ARK_API_KEY"),
+                base_url=configurable.deepseek_api_base_url,
+            )
+        else:
+            raise ValueError("No valid model provider available")
+    
+    if provider == "deepseek" and deepseek_available:
+        # Use direct structured output for DeepSeek
+        structured_llm = llm.with_structured_output(Reflection, method="json_mode")
+    else:
+        structured_llm = llm.with_structured_output(Reflection)
+    
+    result = structured_llm.invoke(formatted_prompt)
 
     return {
         "is_sufficient": result.is_sufficient,
@@ -217,6 +414,80 @@ def evaluate_research(
         ]
 
 
+def direct_answer(state: OverallState, config: RunnableConfig):
+    """LangGraph node that provides direct answer without web research.
+
+    Uses the reasoning model to directly answer the user's question based on 
+    the model's training data without performing web searches.
+
+    Args:
+        state: Current graph state containing the user's question
+        config: Configuration for the runnable, including LLM provider settings
+
+    Returns:
+        Dictionary with state update, including messages with the direct answer
+    """
+    configurable = Configuration.from_runnable_config(config)
+    provider = configurable.model_provider
+
+    # Format the prompt for direct answer
+    current_date = get_current_date()
+    user_question = get_research_topic(state["messages"])
+    
+    direct_answer_prompt = f"""You are a helpful AI assistant. Today's date is {current_date}.
+
+Please provide a comprehensive and accurate answer to the following question based on your knowledge:
+
+Question: {user_question}
+
+Please provide a detailed, well-structured response. If you're uncertain about any facts, please mention that uncertainty. Do not make up information you're not confident about."""
+
+    # Choose model based on provider
+    if provider == "deepseek" and deepseek_available:
+        # Use DeepSeek
+        llm = ChatOpenAI(
+            model=configurable.deepseek_answer_model,
+            temperature=0.7,
+            max_retries=2,
+            api_key=os.getenv("ARK_API_KEY"),
+            base_url=configurable.deepseek_api_base_url,
+        )
+    elif provider == "gemini" and gemini_available:
+        # Use Gemini
+        llm = ChatGoogleGenerativeAI(
+            model=configurable.gemini_answer_model,
+            temperature=0.7,
+            max_retries=2,
+            api_key=os.getenv("GEMINI_API_KEY"),
+        )
+    else:
+        # Fallback
+        if gemini_available:
+            llm = ChatGoogleGenerativeAI(
+                model=configurable.gemini_answer_model,
+                temperature=0.7,
+                max_retries=2,
+                api_key=os.getenv("GEMINI_API_KEY"),
+            )
+        elif deepseek_available:
+            llm = ChatOpenAI(
+                model=configurable.deepseek_answer_model,
+                temperature=0.7,
+                max_retries=2,
+                api_key=os.getenv("ARK_API_KEY"),
+                base_url=configurable.deepseek_api_base_url,
+            )
+        else:
+            raise ValueError("No valid model provider available")
+
+    result = llm.invoke(direct_answer_prompt)
+
+    return {
+        "messages": [AIMessage(content=result.content)],
+        "sources_gathered": [],
+    }
+
+
 def finalize_answer(state: OverallState, config: RunnableConfig):
     """LangGraph node that finalizes the research summary.
 
@@ -231,7 +502,7 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         Dictionary with state update, including running_summary key containing the formatted final summary with sources
     """
     configurable = Configuration.from_runnable_config(config)
-    reasoning_model = state.get("reasoning_model") or configurable.answer_model
+    provider = configurable.model_provider
 
     # Format the prompt
     current_date = get_current_date()
@@ -241,13 +512,44 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
 
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
+    # Choose model based on provider
+    if provider == "deepseek" and deepseek_available:
+        # Use DeepSeek
+        llm = ChatOpenAI(
+            model=configurable.deepseek_answer_model,
+            temperature=0,
+            max_retries=2,
+            api_key=os.getenv("ARK_API_KEY"),
+            base_url=configurable.deepseek_api_base_url,
+        )
+    elif provider == "gemini" and gemini_available:
+        # Use Gemini
+        llm = ChatGoogleGenerativeAI(
+            model=configurable.gemini_answer_model,
+            temperature=0,
+            max_retries=2,
+            api_key=os.getenv("GEMINI_API_KEY"),
+        )
+    else:
+        # Fallback
+        if gemini_available:
+            llm = ChatGoogleGenerativeAI(
+                model=configurable.gemini_answer_model,
+                temperature=0,
+                max_retries=2,
+                api_key=os.getenv("GEMINI_API_KEY"),
+            )
+        elif deepseek_available:
+            llm = ChatOpenAI(
+                model=configurable.deepseek_answer_model,
+                temperature=0,
+                max_retries=2,
+                api_key=os.getenv("ARK_API_KEY"),
+                base_url=configurable.deepseek_api_base_url,
+            )
+        else:
+            raise ValueError("No valid model provider available")
+
     result = llm.invoke(formatted_prompt)
 
     # Replace the short urls with the original urls and add all used urls to the sources_gathered
@@ -273,10 +575,13 @@ builder.add_node("generate_query", generate_query)
 builder.add_node("web_research", web_research)
 builder.add_node("reflection", reflection)
 builder.add_node("finalize_answer", finalize_answer)
+builder.add_node("direct_answer", direct_answer)
 
-# Set the entrypoint as `generate_query`
-# This means that this node is the first one called
-builder.add_edge(START, "generate_query")
+# Set the entrypoint with routing decision
+# This determines whether to use web search or direct answer
+builder.add_conditional_edges(START, decide_search_mode, ["generate_query", "direct_answer"])
+
+# Web search path
 # Add conditional edge to continue with search queries in a parallel branch
 builder.add_conditional_edges(
     "generate_query", continue_to_web_research, ["web_research"]
@@ -290,4 +595,7 @@ builder.add_conditional_edges(
 # Finalize the answer
 builder.add_edge("finalize_answer", END)
 
-graph = builder.compile(name="pro-search-agent")
+# Direct answer path
+builder.add_edge("direct_answer", END)
+
+graph = builder.compile()

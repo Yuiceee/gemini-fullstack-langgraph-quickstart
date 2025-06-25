@@ -8,35 +8,72 @@ from langchain_core.runnables import RunnableConfig
 class Configuration(BaseModel):
     """The configuration for the agent."""
 
+    model_provider: str = Field(
+        default="deepseek",
+        description="The model provider to use: 'gemini' or 'deepseek'"
+    )
+
+    # Gemini models
+    gemini_query_model: str = Field(
+        default="gemini-2.0-flash",
+        description="The Gemini model for query generation."
+    )
+
+    gemini_reflection_model: str = Field(
+        default="gemini-2.5-flash",
+        description="The Gemini model for reflection."
+    )
+
+    gemini_answer_model: str = Field(
+        default="gemini-2.5-pro",
+        description="The Gemini model for answer generation."
+    )
+
+    # DeepSeek models
+    deepseek_query_model: str = Field(
+        default="deepseek-r1-250528",
+        description="The DeepSeek model for query generation."
+    )
+
+    deepseek_reflection_model: str = Field(
+        default="deepseek-r1-250528",
+        description="The DeepSeek model for reflection."
+    )
+
+    deepseek_answer_model: str = Field(
+        default="deepseek-r1-250528",
+        description="The DeepSeek model for answer generation."
+    )
+
+    deepseek_api_base_url: str = Field(
+        default="https://ark.cn-beijing.volces.com/api/v3",
+        description="The base URL for the DeepSeek API."
+    )
+
+    # Legacy fields for backward compatibility
     query_generator_model: str = Field(
         default="gemini-2.0-flash",
-        metadata={
-            "description": "The name of the language model to use for the agent's query generation."
-        },
+        description="Legacy field - use model_provider and specific model fields instead."
     )
 
     reflection_model: str = Field(
         default="gemini-2.5-flash",
-        metadata={
-            "description": "The name of the language model to use for the agent's reflection."
-        },
+        description="Legacy field - use model_provider and specific model fields instead."
     )
 
     answer_model: str = Field(
         default="gemini-2.5-pro",
-        metadata={
-            "description": "The name of the language model to use for the agent's answer."
-        },
+        description="Legacy field - use model_provider and specific model fields instead."
     )
 
     number_of_initial_queries: int = Field(
         default=3,
-        metadata={"description": "The number of initial search queries to generate."},
+        description="The number of initial search queries to generate."
     )
 
     max_research_loops: int = Field(
         default=2,
-        metadata={"description": "The maximum number of research loops to perform."},
+        description="The maximum number of research loops to perform."
     )
 
     @classmethod
@@ -49,10 +86,20 @@ class Configuration(BaseModel):
         )
 
         # Get raw values from environment or config
-        raw_values: dict[str, Any] = {
-            name: os.environ.get(name.upper(), configurable.get(name))
-            for name in cls.model_fields.keys()
-        }
+        raw_values: dict[str, Any] = {}
+        for name in cls.model_fields.keys():
+            # Try environment variable first (uppercase)
+            env_value = os.environ.get(name.upper())
+            if env_value is not None:
+                raw_values[name] = env_value
+            # Then try configurable (lowercase)
+            elif configurable.get(name) is not None:
+                raw_values[name] = configurable.get(name)
+            # Use default value if available
+            else:
+                field_info = cls.model_fields[name]
+                if hasattr(field_info, 'default') and field_info.default is not None:
+                    raw_values[name] = field_info.default
 
         # Filter out None values
         values = {k: v for k, v in raw_values.items() if v is not None}
